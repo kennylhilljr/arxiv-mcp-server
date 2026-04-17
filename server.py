@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-arXiv MCP Server — Full-Text PDF Search
-========================================
+My Research MCP Server — Multi-Source Academic Search
+=====================================================
 An MCP server that lets you:
-  - Search the arXiv API for papers
-  - Download paper PDFs
+  - Search arXiv, Semantic Scholar, Harvard DASH, MIT DSpace,
+    Cornell eCommons, and Penn ScholarlyCommons
+  - Download paper PDFs from any source
   - Extract & index full text from every PDF
   - Query across the full content of your entire local paper library
 
@@ -16,6 +17,7 @@ import re
 import sys
 import json
 import time
+import uuid
 import sqlite3
 import logging
 import hashlib
@@ -514,7 +516,7 @@ def _parse_feed(xml_text: str) -> dict:
 # MCP SERVER & TOOLS
 # ═══════════════════════════════════════════════════════════════════════════
 
-mcp = FastMCP("arxiv")
+mcp = FastMCP("my-research")
 
 _index = None
 
@@ -876,19 +878,2289 @@ def index_stats() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SEMANTIC SCHOLAR TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+SEMANTIC_SCHOLAR_API_BASE = "https://api.semanticscholar.org/graph/v1"
+SS_FIELDS = "title,abstract,authors,year,externalIds,url,openAccessPdf,citationCount,fieldsOfStudy"
+_ss_last_request_time = 0.0
+
+
+def _ss_rate_limit():
+    """Respect Semantic Scholar's rate limits."""
+    global _ss_last_request_time
+    elapsed = time.time() - _ss_last_request_time
+    if elapsed < 1.0:
+        time.sleep(1.0 - elapsed)
+    _ss_last_request_time = time.time()
+
+
+def _ss_request(url: str, params: dict, max_retries: int = 3) -> requests.Response:
+    """Make a Semantic Scholar API request with retry on 429."""
+    for attempt in range(max_retries):
+        _ss_rate_limit()
+        resp = requests.get(url, params=params, timeout=30)
+        if resp.status_code == 429:
+            wait = min(2 ** (attempt + 1), 30)
+            logger.warning(f"Semantic Scholar 429, retrying in {wait}s (attempt {attempt + 1})")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp
+    resp.raise_for_status()  # raise the last 429
+    return resp
+
+
+@mcp.tool()
+def search_semantic_scholar(
+    query: str,
+    max_results: int = 10,
+    year: str = None,
+    fields_of_study: str = None,
+) -> str:
+    """
+    Search Semantic Scholar for papers across all major academic sources
+    (arXiv, PubMed, ACM, IEEE, Springer, etc.).
+
+    This is a cross-repository search that covers far more sources than arXiv alone.
+
+    Args:
+        query: Search terms matched against paper title and abstract.
+               Supports + (require), - (exclude), | (OR), and "quotes" for phrases.
+               Example: "policy as code" +LLM -robotics
+        max_results: 1-100 results to return (default 10).
+        year: Optional year filter. Examples: "2024", "2020-2024", "2020-", "-2023".
+        fields_of_study: Optional comma-separated fields. Examples:
+                         "Computer Science", "Computer Science,Linguistics".
+
+    Returns:
+        JSON with total results and paper entries including title, abstract,
+        authors, year, citation count, external IDs (arXiv, DOI, etc.),
+        and open-access PDF links when available.
+    """
+    if max_results < 1:
+        max_results = 1
+    if max_results > 100:
+        max_results = 100
+
+    params = {
+        "query": query,
+        "limit": max_results,
+        "fields": SS_FIELDS,
+    }
+    if year:
+        params["year"] = year
+    if fields_of_study:
+        params["fieldsOfStudy"] = fields_of_study
+
+    logger.info(f"Semantic Scholar search: {params}")
+    resp = _ss_request(
+        f"{SEMANTIC_SCHOLAR_API_BASE}/paper/search/bulk",
+        params,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    entries = []
+    for paper in data.get("data", []):
+        authors = [a.get("name", "") for a in paper.get("authors", [])]
+        ext_ids = paper.get("externalIds") or {}
+        pdf_info = paper.get("openAccessPdf") or {}
+        entries.append({
+            "paper_id": paper.get("paperId", ""),
+            "title": paper.get("title", ""),
+            "authors": authors,
+            "year": paper.get("year"),
+            "abstract": paper.get("abstract", ""),
+            "citation_count": paper.get("citationCount", 0),
+            "fields_of_study": paper.get("fieldsOfStudy") or [],
+            "arxiv_id": ext_ids.get("ArXiv", ""),
+            "doi": ext_ids.get("DOI", ""),
+            "corpus_id": ext_ids.get("CorpusId", ""),
+            "url": paper.get("url", ""),
+            "open_access_pdf": pdf_info.get("url", ""),
+        })
+
+    return json.dumps({
+        "total_results": data.get("total", 0),
+        "results_count": len(entries),
+        "entries": entries,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_semantic_scholar_paper(paper_id: str) -> str:
+    """
+    Get detailed metadata for a paper from Semantic Scholar.
+
+    Args:
+        paper_id: Semantic Scholar paper ID, arXiv ID (prefix with "ArXiv:"),
+                  DOI (prefix with "DOI:"), or Corpus ID (prefix with "CorpusId:").
+                  Examples: "ArXiv:2509.07006", "DOI:10.1145/1234", "649def34f8be52c8b66281af98ae884c09aef38b"
+    """
+    resp = _ss_request(
+        f"{SEMANTIC_SCHOLAR_API_BASE}/paper/{paper_id}",
+        {"fields": SS_FIELDS + ",references,citations"},
+    )
+    resp.raise_for_status()
+    paper = resp.json()
+
+    authors = [a.get("name", "") for a in paper.get("authors", [])]
+    ext_ids = paper.get("externalIds") or {}
+    pdf_info = paper.get("openAccessPdf") or {}
+
+    refs = []
+    for r in (paper.get("references") or [])[:20]:
+        refs.append({
+            "paper_id": r.get("paperId", ""),
+            "title": r.get("title", ""),
+        })
+
+    cites = []
+    for c in (paper.get("citations") or [])[:20]:
+        cites.append({
+            "paper_id": c.get("paperId", ""),
+            "title": c.get("title", ""),
+        })
+
+    return json.dumps({
+        "paper_id": paper.get("paperId", ""),
+        "title": paper.get("title", ""),
+        "authors": authors,
+        "year": paper.get("year"),
+        "abstract": paper.get("abstract", ""),
+        "citation_count": paper.get("citationCount", 0),
+        "fields_of_study": paper.get("fieldsOfStudy") or [],
+        "arxiv_id": ext_ids.get("ArXiv", ""),
+        "doi": ext_ids.get("DOI", ""),
+        "url": paper.get("url", ""),
+        "open_access_pdf": pdf_info.get("url", ""),
+        "references": refs,
+        "citations": cites,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DSPACE@MIT TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+
+DSPACE_MIT_BASE = "https://dspace.mit.edu/rest"
+
+
+def _dspace_parse_item(item: dict) -> dict:
+    """Parse a DSpace item with metadata into a clean dict."""
+    metadata = item.get("metadata", [])
+    authors = []
+    meta_dict = {}
+    for m in metadata:
+        key = m.get("key", "")
+        value = m.get("value", "")
+        if key == "dc.contributor.author":
+            authors.append(value)
+        elif key not in meta_dict:
+            meta_dict[key] = value
+
+    return {
+        "uuid": item.get("uuid", ""),
+        "title": meta_dict.get("dc.title", item.get("name", "")),
+        "authors": authors,
+        "abstract": meta_dict.get("dc.description.abstract", ""),
+        "date_issued": meta_dict.get("dc.date.issued", ""),
+        "type": meta_dict.get("dc.type", ""),
+        "department": meta_dict.get("dc.contributor.department", ""),
+        "handle_url": f"https://hdl.handle.net/{item.get('handle', '')}",
+        "publisher": meta_dict.get("dc.publisher", ""),
+        "journal": meta_dict.get("dc.relation.journal", ""),
+        "doi": meta_dict.get("dc.relation.isversionof", ""),
+    }
+
+
+def _dspace_search_field(field: str, query: str, limit: int) -> list:
+    """Search a single DSpace metadata field."""
+    resp = requests.get(
+        f"{DSPACE_MIT_BASE}/filtered-items",
+        params={
+            "query_field[]": field,
+            "query_op[]": "contains",
+            "query_val[]": query,
+            "limit": limit,
+            "expand": "metadata",
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json().get("items", [])
+
+
+@mcp.tool()
+def search_mit_dspace(
+    query: str,
+    max_results: int = 10,
+    search_field: str = "all",
+) -> str:
+    """
+    Search MIT's DSpace institutional repository for technical reports,
+    theses, white papers, and peer-reviewed articles by MIT researchers.
+
+    This searches MIT's collection of 60,000+ works across all departments.
+
+    Args:
+        query: Search term to find in item metadata.
+        max_results: 1-100 results to return (default 10).
+        search_field: Where to search. Options:
+                      "all" (default) — searches title and abstract, merges results.
+                      "title" — dc.title only.
+                      "abstract" — dc.description.abstract only.
+                      "author" — dc.contributor.author only.
+                      "subject" — dc.subject only.
+
+    Returns:
+        JSON with matching items including title, authors, abstract,
+        department, date, handle URL, and document type.
+    """
+    if max_results < 1:
+        max_results = 1
+    if max_results > 100:
+        max_results = 100
+
+    logger.info(f"DSpace@MIT search: {query} (field={search_field})")
+
+    if search_field == "all":
+        # Search title and abstract separately, merge and deduplicate
+        title_items = _dspace_search_field("dc.title", query, max_results)
+        abstract_items = _dspace_search_field("dc.description.abstract", query, max_results)
+
+        seen_uuids = set()
+        merged = []
+        for item in title_items + abstract_items:
+            uuid = item.get("uuid", "")
+            if uuid not in seen_uuids:
+                seen_uuids.add(uuid)
+                merged.append(item)
+        items = merged[:max_results]
+    else:
+        field_map = {
+            "title": "dc.title",
+            "abstract": "dc.description.abstract",
+            "author": "dc.contributor.author",
+            "subject": "dc.subject",
+        }
+        dc_field = field_map.get(search_field, "dc.title")
+        items = _dspace_search_field(dc_field, query, max_results)
+
+    entries = [_dspace_parse_item(item) for item in items]
+
+    return json.dumps({
+        "total_results": len(entries),
+        "query": query,
+        "search_field": search_field,
+        "entries": entries,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_mit_dspace_item(uuid: str) -> str:
+    """
+    Get full metadata for a specific item in MIT's DSpace repository.
+
+    Args:
+        uuid: The UUID of the item (from search results).
+    """
+    resp = requests.get(
+        f"{DSPACE_MIT_BASE}/items/{uuid}",
+        params={"expand": "metadata,bitstreams"},
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    item = resp.json()
+
+    metadata = item.get("metadata", [])
+    meta_dict = {}
+    authors = []
+    for m in metadata:
+        key = m.get("key", "")
+        value = m.get("value", "")
+        if key == "dc.contributor.author":
+            authors.append(value)
+        elif key not in meta_dict:
+            meta_dict[key] = value
+
+    bitstreams = []
+    for b in item.get("bitstreams", []):
+        bitstreams.append({
+            "name": b.get("name", ""),
+            "size_bytes": b.get("sizeBytes", 0),
+            "mime_type": b.get("mimeType", ""),
+            "retrieve_link": f"https://dspace.mit.edu{b.get('retrieveLink', '')}",
+        })
+
+    return json.dumps({
+        "uuid": item.get("uuid", ""),
+        "title": meta_dict.get("dc.title", item.get("name", "")),
+        "authors": authors,
+        "abstract": meta_dict.get("dc.description.abstract", ""),
+        "date_issued": meta_dict.get("dc.date.issued", ""),
+        "type": meta_dict.get("dc.type", ""),
+        "department": meta_dict.get("dc.contributor.department", ""),
+        "handle_url": f"https://hdl.handle.net/{item.get('handle', '')}",
+        "publisher": meta_dict.get("dc.publisher", ""),
+        "journal": meta_dict.get("dc.relation.journal", ""),
+        "doi": meta_dict.get("dc.relation.isversionof", ""),
+        "bitstreams": bitstreams,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DSPACE 8 GENERIC HELPERS (Harvard, Cornell, Penn)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DSPACE8_REPOS = {
+    "harvard": {
+        "name": "Harvard DASH",
+        "api_base": "https://dash.harvard.edu/server/api",
+        "web_base": "https://dash.harvard.edu",
+        "description": "58,000+ works: articles, working papers, theses, case studies by Harvard researchers",
+    },
+    "cornell": {
+        "name": "Cornell eCommons",
+        "api_base": "https://ecommons.cornell.edu/server/api",
+        "web_base": "https://ecommons.cornell.edu",
+        "description": "24,000+ works: CS, engineering, policy research by Cornell researchers",
+    },
+    "penn": {
+        "name": "Penn ScholarlyCommons",
+        "api_base": "https://repository.upenn.edu/server/api",
+        "web_base": "https://repository.upenn.edu",
+        "description": "43,000+ works: articles, theses, datasets by UPenn researchers",
+    },
+}
+
+
+def _dspace8_parse_item(item: dict, web_base: str) -> dict:
+    """Parse a DSpace 8 item into a clean dict."""
+    metadata = item.get("metadata", {})
+
+    def _first(key):
+        vals = metadata.get(key, [])
+        return vals[0].get("value", "") if vals else ""
+
+    def _all(key):
+        return [v.get("value", "") for v in metadata.get(key, [])]
+
+    return {
+        "uuid": item.get("uuid", ""),
+        "title": _first("dc.title") or item.get("name", ""),
+        "authors": _all("dc.contributor.author"),
+        "abstract": _first("dc.description.abstract"),
+        "date_issued": _first("dc.date.issued"),
+        "type": _first("dc.type"),
+        "department": _first("dc.contributor.department")
+                      or _first("dc.contributor.other"),
+        "handle_url": f"{web_base}/handle/{item.get('handle', '')}",
+        "publisher": _first("dc.publisher"),
+        "journal": _first("dc.relation.journal")
+                   or _first("dc.source"),
+        "doi": _first("dc.identifier.doi")
+               or _first("dc.relation.isversionof"),
+        "subjects": _all("dc.subject"),
+    }
+
+
+def _dspace8_search(repo_key: str, query: str, max_results: int) -> dict:
+    """Search a DSpace 8 repository."""
+    repo = DSPACE8_REPOS[repo_key]
+    api_base = repo["api_base"]
+
+    logger.info(f"{repo['name']} search: {query}")
+    resp = requests.get(
+        f"{api_base}/discover/search/objects",
+        params={"query": query, "dsoType": "ITEM", "size": max_results},
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    sr = data.get("_embedded", {}).get("searchResult", {})
+    page = sr.get("page", {})
+    total = page.get("totalElements", 0)
+
+    entries = []
+    for obj in sr.get("_embedded", {}).get("objects", []):
+        item = obj.get("_embedded", {}).get("indexableObject", {})
+        entries.append(_dspace8_parse_item(item, repo["web_base"]))
+
+    return {
+        "total_results": total,
+        "results_count": len(entries),
+        "source": repo["name"],
+        "query": query,
+        "entries": entries,
+    }
+
+
+def _dspace8_get_item(repo_key: str, uuid: str) -> dict:
+    """Get full metadata + bitstreams for a DSpace 8 item."""
+    repo = DSPACE8_REPOS[repo_key]
+    api_base = repo["api_base"]
+
+    resp = requests.get(
+        f"{api_base}/core/items/{uuid}",
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    item = resp.json()
+
+    bitstreams = []
+    try:
+        bs_resp = requests.get(
+            f"{api_base}/core/items/{uuid}/bundles",
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        bs_resp.raise_for_status()
+        bundles = bs_resp.json().get("_embedded", {}).get("bundles", [])
+        for bundle in bundles:
+            if bundle.get("name") == "ORIGINAL":
+                bs_list_resp = requests.get(
+                    f"{api_base}/core/bundles/{bundle['uuid']}/bitstreams",
+                    headers={"Accept": "application/json"},
+                    timeout=30,
+                )
+                bs_list_resp.raise_for_status()
+                for b in bs_list_resp.json().get("_embedded", {}).get("bitstreams", []):
+                    bitstreams.append({
+                        "name": b.get("name", ""),
+                        "size_bytes": b.get("sizeBytes", 0),
+                        "mime_type": b.get("metadata", {}).get(
+                            "dc.format.mimetype", [{}]
+                        )[0].get("value", "") if b.get("metadata") else "",
+                        "retrieve_link": f"{api_base}/core/bitstreams/{b['uuid']}/content",
+                    })
+    except Exception:
+        pass
+
+    result = _dspace8_parse_item(item, repo["web_base"])
+    result["bitstreams"] = bitstreams
+    return result
+
+
+# ── Harvard DASH ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def search_harvard_dash(query: str, max_results: int = 10) -> str:
+    """
+    Search Harvard's DASH open-access repository for scholarly works.
+    58,000+ works: articles, working papers, theses, case studies.
+
+    Args:
+        query: Search terms (matched against title, abstract, metadata).
+        max_results: 1-100 results to return (default 10).
+    """
+    max_results = max(1, min(100, max_results))
+    return json.dumps(_dspace8_search("harvard", query, max_results), indent=2)
+
+
+@mcp.tool()
+def get_harvard_dash_item(uuid: str) -> str:
+    """
+    Get full metadata and downloadable files for a Harvard DASH item.
+
+    Args:
+        uuid: The UUID of the item (from search results).
+    """
+    return json.dumps(_dspace8_get_item("harvard", uuid), indent=2)
+
+
+# ── Cornell eCommons ────────────────────────────────────────────────────
+
+@mcp.tool()
+def search_cornell_ecommons(query: str, max_results: int = 10) -> str:
+    """
+    Search Cornell's eCommons repository for scholarly works.
+    24,000+ works: strong in CS, engineering, and policy research.
+    Includes theses, articles, technical reports, and datasets.
+
+    Args:
+        query: Search terms (matched against title, abstract, metadata).
+        max_results: 1-100 results to return (default 10).
+    """
+    max_results = max(1, min(100, max_results))
+    return json.dumps(_dspace8_search("cornell", query, max_results), indent=2)
+
+
+@mcp.tool()
+def get_cornell_ecommons_item(uuid: str) -> str:
+    """
+    Get full metadata and downloadable files for a Cornell eCommons item.
+
+    Args:
+        uuid: The UUID of the item (from search results).
+    """
+    return json.dumps(_dspace8_get_item("cornell", uuid), indent=2)
+
+
+# ── Penn ScholarlyCommons ──────────────────────────────────────────────
+
+@mcp.tool()
+def search_penn_scholarly(query: str, max_results: int = 10) -> str:
+    """
+    Search UPenn's ScholarlyCommons repository for scholarly works.
+    43,000+ works: articles, theses, datasets, conference papers.
+    Strong in AI ethics, governance, and policy research.
+
+    Args:
+        query: Search terms (matched against title, abstract, metadata).
+        max_results: 1-100 results to return (default 10).
+    """
+    max_results = max(1, min(100, max_results))
+    return json.dumps(_dspace8_search("penn", query, max_results), indent=2)
+
+
+@mcp.tool()
+def get_penn_scholarly_item(uuid: str) -> str:
+    """
+    Get full metadata and downloadable files for a Penn ScholarlyCommons item.
+
+    Args:
+        uuid: The UUID of the item (from search results).
+    """
+    return json.dumps(_dspace8_get_item("penn", uuid), indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DOI TOOLS (Crossref, DataCite, Unpaywall, Content Negotiation)
+# ═══════════════════════════════════════════════════════════════════════════
+
+CROSSREF_API_BASE = "https://api.crossref.org/works"
+DATACITE_API_BASE = "https://api.datacite.org/dois"
+UNPAYWALL_API_BASE = "https://api.unpaywall.org/v2"
+UNPAYWALL_EMAIL = os.environ.get("UNPAYWALL_EMAIL", "research-mcp@example.com")
+
+
+def _parse_crossref(item: dict) -> dict:
+    """Parse a Crossref work item into a clean dict."""
+    authors = []
+    for a in item.get("author", []):
+        name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+        if name:
+            authors.append(name)
+
+    container = item.get("container-title", [])
+    journal = container[0] if container else ""
+
+    published_parts = item.get("published-print", item.get("published-online", {}))
+    date_parts = published_parts.get("date-parts", [[]])[0]
+    date_str = "-".join(str(d) for d in date_parts) if date_parts else ""
+
+    abstract = item.get("abstract", "")
+    # Crossref abstracts sometimes contain JATS XML tags
+    if abstract:
+        abstract = re.sub(r"<[^>]+>", "", abstract).strip()
+
+    return {
+        "doi": item.get("DOI", ""),
+        "title": item.get("title", [""])[0] if item.get("title") else "",
+        "authors": authors,
+        "abstract": abstract,
+        "journal": journal,
+        "publisher": item.get("publisher", ""),
+        "type": item.get("type", ""),
+        "published": date_str,
+        "url": item.get("URL", ""),
+        "citation_count": item.get("is-referenced-by-count", 0),
+        "references_count": item.get("references-count", 0),
+        "issn": item.get("ISSN", []),
+        "subject": item.get("subject", []),
+        "license": [
+            lic.get("URL", "") for lic in item.get("license", [])
+        ],
+    }
+
+
+@mcp.tool()
+def resolve_doi(doi: str) -> str:
+    """
+    Resolve a DOI to get full metadata from Crossref (articles) or DataCite (datasets).
+
+    Retrieves title, authors, abstract, journal, publisher, citation count,
+    license, and more.
+
+    Args:
+        doi: A DOI string, e.g. "10.1145/3649835" or "10.1038/s41586-020-2649-2".
+             Can include "https://doi.org/" prefix — it will be stripped.
+
+    Returns:
+        JSON with full metadata from Crossref or DataCite.
+    """
+    # Clean the DOI
+    doi = doi.strip()
+    for prefix in ["https://doi.org/", "http://doi.org/", "doi:"]:
+        if doi.lower().startswith(prefix.lower()):
+            doi = doi[len(prefix):]
+
+    # Try Crossref first (covers most scholarly articles)
+    try:
+        resp = requests.get(
+            f"{CROSSREF_API_BASE}/{doi}",
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            item = data.get("message", {})
+            result = _parse_crossref(item)
+            result["source"] = "crossref"
+            return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.warning(f"Crossref lookup failed for {doi}: {e}")
+
+    # Fallback to DataCite (datasets, software, etc.)
+    try:
+        resp = requests.get(
+            f"{DATACITE_API_BASE}/{doi}",
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            attrs = data.get("attributes", {})
+            creators = [
+                c.get("name", "") or f"{c.get('givenName', '')} {c.get('familyName', '')}".strip()
+                for c in attrs.get("creators", [])
+            ]
+            return json.dumps({
+                "doi": doi,
+                "title": attrs.get("titles", [{}])[0].get("title", ""),
+                "authors": creators,
+                "abstract": (attrs.get("descriptions", [{}])[0].get("description", "")
+                             if attrs.get("descriptions") else ""),
+                "publisher": attrs.get("publisher", ""),
+                "type": attrs.get("types", {}).get("resourceTypeGeneral", ""),
+                "published": str(attrs.get("publicationYear", "")),
+                "url": attrs.get("url", ""),
+                "source": "datacite",
+            }, indent=2)
+    except Exception as e:
+        logger.warning(f"DataCite lookup failed for {doi}: {e}")
+
+    return json.dumps({"error": f"Could not resolve DOI: {doi}", "doi": doi})
+
+
+@mcp.tool()
+def search_crossref(
+    query: str,
+    max_results: int = 10,
+    filter_type: str = None,
+    sort: str = "relevance",
+) -> str:
+    """
+    Search Crossref for scholarly works by query across all publishers
+    (ACM, IEEE, Springer, Elsevier, Wiley, etc.).
+
+    Crossref indexes 150M+ works. Use this to find papers by title/author/topic
+    when you have a DOI or want to search beyond arXiv.
+
+    Args:
+        query: Search terms matched against titles, authors, abstracts, and full text.
+        max_results: 1-100 results to return (default 10).
+        filter_type: Optional type filter. Examples: "journal-article", "proceedings-article",
+                     "book-chapter", "dissertation". Leave empty for all types.
+        sort: Sort order. Options: "relevance" (default), "published", "is-referenced-by-count".
+
+    Returns:
+        JSON with total results and entries including title, authors, journal,
+        DOI, citation count, and publication date.
+    """
+    if max_results < 1:
+        max_results = 1
+    if max_results > 100:
+        max_results = 100
+
+    params = {
+        "query": query,
+        "rows": max_results,
+        "sort": sort,
+        "order": "desc" if sort != "relevance" else None,
+    }
+    if filter_type:
+        params["filter"] = f"type:{filter_type}"
+
+    # Remove None values
+    params = {k: v for k, v in params.items() if v is not None}
+
+    logger.info(f"Crossref search: {params}")
+    resp = requests.get(
+        CROSSREF_API_BASE,
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("message", {})
+
+    entries = [_parse_crossref(item) for item in data.get("items", [])]
+
+    return json.dumps({
+        "total_results": data.get("total-results", 0),
+        "results_count": len(entries),
+        "query": query,
+        "entries": entries,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_doi_citation(
+    doi: str,
+    style: str = "apa",
+    format: str = "text",
+) -> str:
+    """
+    Get a formatted citation for a DOI using content negotiation.
+
+    Args:
+        doi: The DOI string, e.g. "10.1145/3649835".
+        style: Citation style. Options: "apa", "chicago-author-date", "ieee",
+               "harvard-cite-them-right", "modern-language-association".
+               Default: "apa".
+        format: Output format. Options:
+                "text" — plain text citation (default).
+                "bibtex" — BibTeX entry.
+                "citeproc" — structured JSON (CSL-JSON).
+
+    Returns:
+        The formatted citation string or JSON.
+    """
+    doi = doi.strip()
+    for prefix in ["https://doi.org/", "http://doi.org/", "doi:"]:
+        if doi.lower().startswith(prefix.lower()):
+            doi = doi[len(prefix):]
+
+    mime_map = {
+        "text": f"text/x-bibliography; style={style}",
+        "bibtex": "application/x-bibtex",
+        "citeproc": "application/citeproc+json",
+    }
+    accept = mime_map.get(format, f"text/x-bibliography; style={style}")
+
+    resp = requests.get(
+        f"https://doi.org/{doi}",
+        headers={"Accept": accept},
+        timeout=30,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    if format == "citeproc":
+        return json.dumps(resp.json(), indent=2)
+    return resp.text.strip()
+
+
+@mcp.tool()
+def download_paper_by_doi(
+    doi: str,
+    auto_index: bool = True,
+    download_dir: str = None,
+) -> str:
+    """
+    Find and download the open-access PDF for a paper given its DOI,
+    then index it for full-text search.
+
+    Uses multiple sources to find free/legal PDFs:
+      1. Unpaywall (if UNPAYWALL_EMAIL env var is set to your real email)
+      2. Semantic Scholar open-access PDF links
+      3. Crossref license check (some CC-licensed works have direct links)
+
+    Args:
+        doi: The DOI of the paper, e.g. "10.1145/3649835".
+        auto_index: If True (default), extract and index the text after download.
+        download_dir: Custom download directory. Default: ~/arxiv-papers.
+
+    Returns:
+        JSON with file path, metadata, and indexing status.
+        If no open-access PDF exists, returns an error with the DOI metadata.
+    """
+    doi = doi.strip()
+    for prefix in ["https://doi.org/", "http://doi.org/", "doi:"]:
+        if doi.lower().startswith(prefix.lower()):
+            doi = doi[len(prefix):]
+
+    # Step 1: Get metadata from Crossref
+    metadata = {}
+    try:
+        cr_resp = requests.get(
+            f"{CROSSREF_API_BASE}/{doi}",
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        if cr_resp.status_code == 200:
+            metadata = _parse_crossref(cr_resp.json().get("message", {}))
+    except Exception:
+        pass
+
+    # Step 2: Find open-access PDF via multiple sources
+    pdf_url = None
+    oa_status = "unknown"
+    pdf_source = ""
+
+    # Source A: Unpaywall (requires real email in UNPAYWALL_EMAIL env var)
+    if UNPAYWALL_EMAIL and "example.com" not in UNPAYWALL_EMAIL:
+        try:
+            up_resp = requests.get(
+                f"{UNPAYWALL_API_BASE}/{doi}",
+                params={"email": UNPAYWALL_EMAIL},
+                timeout=30,
+            )
+            if up_resp.status_code == 200:
+                up_data = up_resp.json()
+                oa_status = up_data.get("oa_status", "closed")
+                best_loc = up_data.get("best_oa_location")
+                if best_loc:
+                    pdf_url = best_loc.get("url_for_pdf") or best_loc.get("url")
+                    pdf_source = "unpaywall"
+                if not pdf_url:
+                    for loc in up_data.get("oa_locations", []):
+                        url = loc.get("url_for_pdf") or loc.get("url")
+                        if url:
+                            pdf_url = url
+                            pdf_source = "unpaywall"
+                            break
+        except Exception as e:
+            logger.warning(f"Unpaywall lookup failed for {doi}: {e}")
+
+    # Source B: Semantic Scholar openAccessPdf
+    if not pdf_url:
+        try:
+            _ss_rate_limit()
+            ss_resp = requests.get(
+                f"{SEMANTIC_SCHOLAR_API_BASE}/paper/DOI:{doi}",
+                params={"fields": "openAccessPdf,externalIds,title,authors"},
+                timeout=30,
+            )
+            if ss_resp.status_code == 200:
+                ss_data = ss_resp.json()
+                oa_pdf = ss_data.get("openAccessPdf") or {}
+                if oa_pdf.get("url"):
+                    pdf_url = oa_pdf["url"]
+                    pdf_source = "semantic_scholar"
+                # Also check if there's an arXiv version we can grab
+                ext_ids = ss_data.get("externalIds") or {}
+                arxiv_id = ext_ids.get("ArXiv", "")
+                if not pdf_url and arxiv_id:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+                    pdf_source = "arxiv_via_semantic_scholar"
+        except Exception as e:
+            logger.warning(f"Semantic Scholar lookup failed for {doi}: {e}")
+
+    if not pdf_url:
+        return json.dumps({
+            "error": "No open-access PDF found for this DOI.",
+            "doi": doi,
+            "oa_status": oa_status,
+            "metadata": metadata,
+            "suggestion": "This paper may require institutional access. "
+                          "Set UNPAYWALL_EMAIL env var to your real email for better OA coverage, "
+                          "or check if an arXiv preprint exists via search_semantic_scholar.",
+        }, indent=2)
+
+    # Step 3: Download the PDF
+    target_dir = _get_download_dir(download_dir)
+    clean_doi = doi.replace("/", "_").replace(":", "_")
+    filepath = target_dir / f"doi_{clean_doi}.pdf"
+
+    try:
+        logger.info(f"Downloading PDF for DOI {doi} from {pdf_url}")
+        pdf_resp = requests.get(pdf_url, timeout=120, stream=True, headers={
+            "User-Agent": "research-mcp/1.0 (mailto:{})".format(UNPAYWALL_EMAIL),
+        })
+        pdf_resp.raise_for_status()
+
+        with open(filepath, "wb") as f:
+            for chunk in pdf_resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        return json.dumps({
+            "error": f"PDF download failed: {e}",
+            "doi": doi,
+            "pdf_url": pdf_url,
+            "metadata": metadata,
+        }, indent=2)
+
+    file_size = filepath.stat().st_size
+    result = {
+        "status": "downloaded",
+        "file_path": str(filepath),
+        "file_size_bytes": file_size,
+        "file_size_mb": round(file_size / (1024 * 1024), 2),
+        "doi": doi,
+        "title": metadata.get("title", ""),
+        "authors": metadata.get("authors", []),
+        "oa_status": oa_status,
+        "pdf_url": pdf_url,
+        "pdf_source": pdf_source,
+        "indexed": False,
+    }
+
+    if auto_index:
+        try:
+            idx = _get_index()
+            pages = extract_text_from_pdf(str(filepath))
+            chunks = chunk_pages(pages)
+            content_hash = compute_content_hash(str(filepath))
+            paper_meta = {
+                "arxiv_id": f"doi:{doi}",
+                "title": result["title"],
+                "authors": result["authors"],
+                "summary": metadata.get("abstract", ""),
+                "categories": metadata.get("subject", []),
+                "published": metadata.get("published", ""),
+            }
+            idx.upsert_paper(paper_meta, chunks, str(filepath), len(pages), content_hash)
+            result["indexed"] = True
+            result["total_pages"] = len(pages)
+            result["total_chunks"] = len(chunks)
+        except Exception as e:
+            result["index_error"] = str(e)
+            logger.error(f"Indexing failed for DOI {doi}: {e}")
+
+    return json.dumps(result, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OPENALEX TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+# OpenAlex (https://openalex.org) — Free, CC0 catalog of 250M+ scholarly works.
+# Polite pool: include email in User-Agent or `mailto` param for higher rate limits.
+
+OPENALEX_API_BASE = "https://api.openalex.org"
+OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
+
+
+def _openalex_params(extra: dict = None) -> dict:
+    params = dict(extra or {})
+    if OPENALEX_EMAIL:
+        params["mailto"] = OPENALEX_EMAIL
+    return params
+
+
+def _parse_openalex_work(work: dict) -> dict:
+    """Parse an OpenAlex work into a clean dict."""
+    authors = []
+    institutions = []
+    for authorship in work.get("authorships", []):
+        a = authorship.get("author", {}) or {}
+        if a.get("display_name"):
+            authors.append(a["display_name"])
+        for inst in authorship.get("institutions", []) or []:
+            name = inst.get("display_name")
+            if name and name not in institutions:
+                institutions.append(name)
+
+    # Concepts (deprecated but still useful) and topics
+    concepts = [
+        c.get("display_name", "") for c in (work.get("concepts") or [])[:5]
+        if c.get("display_name")
+    ]
+    topics = [
+        t.get("display_name", "") for t in (work.get("topics") or [])[:5]
+        if t.get("display_name")
+    ]
+
+    # Best OA location for PDF
+    oa_location = work.get("best_oa_location") or {}
+    pdf_url = oa_location.get("pdf_url") or ""
+
+    # Build a clean ID (strip URL prefix)
+    work_id = work.get("id", "").replace("https://openalex.org/", "")
+
+    return {
+        "openalex_id": work_id,
+        "doi": (work.get("doi") or "").replace("https://doi.org/", ""),
+        "title": work.get("title") or work.get("display_name", ""),
+        "authors": authors,
+        "institutions": institutions,
+        "year": work.get("publication_year"),
+        "publication_date": work.get("publication_date", ""),
+        "abstract": _openalex_abstract(work.get("abstract_inverted_index")),
+        "type": work.get("type", ""),
+        "venue": (work.get("primary_location") or {}).get("source", {}).get("display_name", "") if work.get("primary_location") else "",
+        "citation_count": work.get("cited_by_count", 0),
+        "concepts": concepts,
+        "topics": topics,
+        "is_oa": work.get("open_access", {}).get("is_oa", False),
+        "oa_status": work.get("open_access", {}).get("oa_status", ""),
+        "pdf_url": pdf_url,
+        "url": (work.get("primary_location") or {}).get("landing_page_url", ""),
+    }
+
+
+def _openalex_abstract(inverted_index: dict) -> str:
+    """Reconstruct abstract from OpenAlex's inverted index format."""
+    if not inverted_index:
+        return ""
+    word_positions = []
+    for word, positions in inverted_index.items():
+        for pos in positions:
+            word_positions.append((pos, word))
+    word_positions.sort()
+    return " ".join(w for _, w in word_positions)
+
+
+@mcp.tool()
+def search_openalex(
+    query: str,
+    max_results: int = 10,
+    year_from: int = None,
+    year_to: int = None,
+    concept: str = None,
+    institution: str = None,
+    open_access_only: bool = False,
+    sort: str = "relevance_score:desc",
+) -> str:
+    """
+    Search OpenAlex — a free, CC0 catalog of 250M+ scholarly works covering
+    all disciplines. Better than Semantic Scholar for institution affiliations,
+    funder data, concept/topic taxonomies, and citation networks.
+
+    Args:
+        query: Search terms (matched against title, abstract, full text).
+        max_results: 1-200 results to return (default 10).
+        year_from: Optional earliest publication year (e.g. 2020).
+        year_to: Optional latest publication year (e.g. 2025).
+        concept: Optional concept name filter (e.g. "Computer security",
+                 "Access control", "Machine learning").
+        institution: Optional institution name (e.g. "Stanford University").
+        open_access_only: If True, only return open-access works.
+        sort: Sort order. Options:
+              "relevance_score:desc" (default), "cited_by_count:desc",
+              "publication_date:desc", "publication_date:asc".
+
+    Returns:
+        JSON with total results and entries including title, authors,
+        institutions, year, abstract, citation count, concepts/topics,
+        and PDF URL when available.
+    """
+    if max_results < 1:
+        max_results = 1
+    if max_results > 200:
+        max_results = 200
+
+    # Build filter string
+    filters = []
+    if year_from:
+        filters.append(f"from_publication_date:{year_from}-01-01")
+    if year_to:
+        filters.append(f"to_publication_date:{year_to}-12-31")
+    if open_access_only:
+        filters.append("is_oa:true")
+    if concept:
+        filters.append(f"concepts.display_name.search:{concept}")
+    if institution:
+        filters.append(f"institutions.display_name.search:{institution}")
+
+    params = _openalex_params({
+        "search": query,
+        "per-page": max_results,
+        "sort": sort,
+    })
+    if filters:
+        params["filter"] = ",".join(filters)
+
+    logger.info(f"OpenAlex search: {params}")
+    resp = requests.get(
+        f"{OPENALEX_API_BASE}/works",
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    entries = [_parse_openalex_work(w) for w in data.get("results", [])]
+
+    return json.dumps({
+        "total_results": data.get("meta", {}).get("count", 0),
+        "results_count": len(entries),
+        "query": query,
+        "entries": entries,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_openalex_work(work_id: str) -> str:
+    """
+    Get full metadata for an OpenAlex work, including references and
+    related works.
+
+    Args:
+        work_id: OpenAlex work ID (e.g. "W2741809807"), DOI (prefix with
+                 "doi:"), or full OpenAlex URL.
+
+    Returns:
+        JSON with full metadata, abstract, references, and related works.
+    """
+    work_id = work_id.strip()
+    work_id = work_id.replace("https://openalex.org/", "")
+    if work_id.lower().startswith("doi:"):
+        work_id = "doi:" + work_id[4:].replace("https://doi.org/", "")
+
+    resp = requests.get(
+        f"{OPENALEX_API_BASE}/works/{work_id}",
+        params=_openalex_params(),
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    work = resp.json()
+
+    result = _parse_openalex_work(work)
+
+    # Add references and related works (just IDs and titles)
+    refs = []
+    for ref_id in (work.get("referenced_works") or [])[:30]:
+        refs.append(ref_id.replace("https://openalex.org/", ""))
+    result["referenced_works"] = refs
+
+    related = []
+    for rel_id in (work.get("related_works") or [])[:20]:
+        related.append(rel_id.replace("https://openalex.org/", ""))
+    result["related_works"] = related
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def search_openalex_authors(query: str, max_results: int = 10) -> str:
+    """
+    Search OpenAlex for authors by name. Useful for disambiguating authors
+    and finding all of their works.
+
+    Args:
+        query: Author name (e.g. "Scott Stoller").
+        max_results: 1-50 results (default 10).
+
+    Returns:
+        JSON with author entries including ID, name, affiliations,
+        works count, and citation count.
+    """
+    if max_results < 1:
+        max_results = 1
+    if max_results > 50:
+        max_results = 50
+
+    params = _openalex_params({
+        "search": query,
+        "per-page": max_results,
+    })
+
+    resp = requests.get(
+        f"{OPENALEX_API_BASE}/authors",
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    entries = []
+    for a in data.get("results", []):
+        last_inst = (a.get("last_known_institution") or {}).get("display_name", "")
+        entries.append({
+            "author_id": (a.get("id") or "").replace("https://openalex.org/", ""),
+            "name": a.get("display_name", ""),
+            "orcid": a.get("orcid", ""),
+            "last_known_institution": last_inst,
+            "works_count": a.get("works_count", 0),
+            "cited_by_count": a.get("cited_by_count", 0),
+            "h_index": (a.get("summary_stats") or {}).get("h_index", 0),
+        })
+
+    return json.dumps({
+        "total_results": data.get("meta", {}).get("count", 0),
+        "results_count": len(entries),
+        "entries": entries,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CORE TOOLS
+# ═══════════════════════════════════════════════════════════════════════════
+# CORE (https://core.ac.uk) — Largest aggregator of OA papers (200M+ works
+# across 11,000+ repositories). Best source for technical reports, working
+# papers, and grey literature. Requires a free API key from
+# https://core.ac.uk/services/api
+
+CORE_API_BASE = "https://api.core.ac.uk/v3"
+CORE_API_KEY = os.environ.get("CORE_API_KEY", "")
+_core_last_request_time = 0.0
+
+
+def _core_rate_limit():
+    """CORE allows ~10 requests/minute on the free tier."""
+    global _core_last_request_time
+    elapsed = time.time() - _core_last_request_time
+    if elapsed < 6.5:
+        time.sleep(6.5 - elapsed)
+    _core_last_request_time = time.time()
+
+
+def _core_headers() -> dict:
+    h = {"Accept": "application/json"}
+    if CORE_API_KEY:
+        h["Authorization"] = f"Bearer {CORE_API_KEY}"
+    return h
+
+
+def _parse_core_work(work: dict) -> dict:
+    """Parse a CORE work into a clean dict."""
+    authors = []
+    for a in work.get("authors", []) or []:
+        name = a.get("name", "") if isinstance(a, dict) else str(a)
+        if name:
+            authors.append(name)
+
+    # Find best PDF link
+    download_url = work.get("downloadUrl", "")
+    fulltext_urls = []
+    for link in work.get("links", []) or []:
+        if isinstance(link, dict) and link.get("type") == "download":
+            fulltext_urls.append(link.get("url", ""))
+
+    # Repository info
+    repo = (work.get("dataProviders") or [{}])[0] if work.get("dataProviders") else {}
+    repo_name = repo.get("name", "") if isinstance(repo, dict) else ""
+
+    return {
+        "core_id": str(work.get("id", "")),
+        "doi": work.get("doi", ""),
+        "title": work.get("title", ""),
+        "authors": authors,
+        "abstract": work.get("abstract", ""),
+        "year": work.get("yearPublished"),
+        "publication_date": work.get("publishedDate", ""),
+        "type": work.get("documentType", ""),
+        "publisher": work.get("publisher", ""),
+        "repository": repo_name,
+        "language": (work.get("language") or {}).get("name", "") if work.get("language") else "",
+        "download_url": download_url,
+        "fulltext_urls": fulltext_urls,
+        "url": work.get("sourceFulltextUrls", [""])[0] if work.get("sourceFulltextUrls") else "",
+    }
+
+
+@mcp.tool()
+def search_core(
+    query: str,
+    max_results: int = 10,
+    year_from: int = None,
+    year_to: int = None,
+    document_type: str = None,
+) -> str:
+    """
+    Search CORE — the world's largest aggregator of open access research,
+    with 200M+ works from 11,000+ repositories. Best source for technical
+    reports, working papers, theses, and grey literature that aren't on
+    arXiv or in traditional journals.
+
+    Requires CORE_API_KEY environment variable. Get a free key at
+    https://core.ac.uk/services/api
+
+    Args:
+        query: Search terms. CORE supports field-specific syntax:
+               'title:"policy mining"', 'authors:"Stoller"', etc.
+        max_results: 1-100 results (default 10).
+        year_from: Optional earliest publication year.
+        year_to: Optional latest publication year.
+        document_type: Optional filter. Examples: "research", "thesis",
+                       "report", "preprint", "conference", "book".
+
+    Returns:
+        JSON with works including title, authors, abstract, repository,
+        and direct PDF download URL.
+    """
+    if not CORE_API_KEY:
+        return json.dumps({
+            "error": "CORE_API_KEY not set. Get a free key at "
+                     "https://core.ac.uk/services/api and set the env var.",
+        })
+
+    if max_results < 1:
+        max_results = 1
+    if max_results > 100:
+        max_results = 100
+
+    # Build query with filters
+    q_parts = [query]
+    if year_from:
+        q_parts.append(f"yearPublished>={year_from}")
+    if year_to:
+        q_parts.append(f"yearPublished<={year_to}")
+    if document_type:
+        q_parts.append(f'documentType:"{document_type}"')
+    full_query = " AND ".join(q_parts)
+
+    params = {
+        "q": full_query,
+        "limit": max_results,
+    }
+
+    _core_rate_limit()
+    logger.info(f"CORE search: {full_query}")
+    resp = requests.get(
+        f"{CORE_API_BASE}/search/works",
+        params=params,
+        headers=_core_headers(),
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    entries = [_parse_core_work(w) for w in data.get("results", [])]
+
+    return json.dumps({
+        "total_results": data.get("totalHits", 0),
+        "results_count": len(entries),
+        "query": full_query,
+        "entries": entries,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_core_work(core_id: str) -> str:
+    """
+    Get full metadata for a CORE work by its ID.
+
+    Args:
+        core_id: The CORE work ID (numeric, from search results).
+    """
+    if not CORE_API_KEY:
+        return json.dumps({"error": "CORE_API_KEY not set."})
+
+    _core_rate_limit()
+    resp = requests.get(
+        f"{CORE_API_BASE}/works/{core_id}",
+        headers=_core_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return json.dumps(_parse_core_work(resp.json()), indent=2)
+
+
+@mcp.tool()
+def download_core_paper(
+    core_id: str,
+    auto_index: bool = True,
+    download_dir: str = None,
+) -> str:
+    """
+    Download a paper's PDF from CORE and index it for full-text search.
+
+    CORE provides direct PDF access for many works that have Cloudflare
+    or paywall issues elsewhere — useful as a fallback.
+
+    Args:
+        core_id: The CORE work ID.
+        auto_index: If True (default), index after download.
+        download_dir: Custom download directory.
+    """
+    if not CORE_API_KEY:
+        return json.dumps({"error": "CORE_API_KEY not set."})
+
+    # Get metadata
+    _core_rate_limit()
+    meta_resp = requests.get(
+        f"{CORE_API_BASE}/works/{core_id}",
+        headers=_core_headers(),
+        timeout=30,
+    )
+    meta_resp.raise_for_status()
+    work = meta_resp.json()
+    metadata = _parse_core_work(work)
+
+    pdf_url = metadata.get("download_url") or (
+        metadata["fulltext_urls"][0] if metadata.get("fulltext_urls") else ""
+    )
+
+    if not pdf_url:
+        return json.dumps({
+            "error": "No PDF download URL available for this CORE work.",
+            "core_id": core_id,
+            "metadata": metadata,
+        }, indent=2)
+
+    # Download
+    target_dir = _get_download_dir(download_dir)
+    filepath = target_dir / f"core_{core_id}.pdf"
+
+    try:
+        logger.info(f"Downloading CORE paper {core_id} from {pdf_url}")
+        pdf_resp = requests.get(
+            pdf_url,
+            timeout=120,
+            stream=True,
+            headers=_core_headers(),
+        )
+        pdf_resp.raise_for_status()
+        with open(filepath, "wb") as f:
+            for chunk in pdf_resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        return json.dumps({
+            "error": f"PDF download failed: {e}",
+            "core_id": core_id,
+            "pdf_url": pdf_url,
+        }, indent=2)
+
+    file_size = filepath.stat().st_size
+    result = {
+        "status": "downloaded",
+        "file_path": str(filepath),
+        "file_size_bytes": file_size,
+        "file_size_mb": round(file_size / (1024 * 1024), 2),
+        "core_id": core_id,
+        "title": metadata.get("title", ""),
+        "authors": metadata.get("authors", []),
+        "indexed": False,
+    }
+
+    if auto_index:
+        try:
+            idx = _get_index()
+            pages = extract_text_from_pdf(str(filepath))
+            chunks = chunk_pages(pages)
+            content_hash = compute_content_hash(str(filepath))
+            paper_meta = {
+                "arxiv_id": f"core:{core_id}",
+                "title": metadata.get("title", ""),
+                "authors": metadata.get("authors", []),
+                "summary": metadata.get("abstract", ""),
+                "categories": [],
+                "published": metadata.get("publication_date", ""),
+            }
+            idx.upsert_paper(paper_meta, chunks, str(filepath), len(pages), content_hash)
+            result["indexed"] = True
+            result["total_pages"] = len(pages)
+            result["total_chunks"] = len(chunks)
+        except Exception as e:
+            result["index_error"] = str(e)
+            logger.error(f"Indexing failed for CORE {core_id}: {e}")
+
+    return json.dumps(result, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLOUD VENDOR DOCUMENTATION (AWS, Google Cloud, Microsoft Learn)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Live search over AWS, GCP, and Microsoft Learn documentation sites.
+# These tools return JSON snippets + canonical URLs; they do not download or
+# index pages into the FTS5 store (docs change too frequently for local
+# indexing to pay off).
+#
+#   AWS            — public unauthenticated search proxy used by the AWS docs
+#                    site (same endpoint awslabs/mcp calls).
+#   Google Cloud   — Developer Knowledge API (developerknowledge.googleapis.com).
+#                    Requires GOOGLE_DEVKNOWLEDGE_API_KEY (enable the API in a
+#                    Google Cloud project and create an API key, ideally
+#                    restricted to this single API).
+#   Microsoft Learn — public site-search endpoint learn.microsoft.com/api/search
+#                     used by the learn.microsoft.com search bar itself.
+
+AWS_DOCS_SEARCH_URL = "https://proxy.search.docs.aws.com/search"
+AWS_DOCS_USER_AGENT = "my-research-mcp-server/2.0 (+docs-search)"
+
+GOOGLE_DEVKNOWLEDGE_API_KEY = os.environ.get("GOOGLE_DEVKNOWLEDGE_API_KEY")
+GOOGLE_DEVKNOWLEDGE_BASE = "https://developerknowledge.googleapis.com/v1alpha"
+
+MS_LEARN_SEARCH_URL = "https://learn.microsoft.com/api/search"
+
+
+@mcp.tool()
+def search_aws_docs(query: str, max_results: int = 10) -> str:
+    """
+    Search the official AWS documentation (docs.aws.amazon.com).
+
+    Uses the public search proxy that powers the AWS docs site. No auth.
+    Returns titles, URLs, and snippets — fetch the page separately to read.
+
+    Args:
+        query: Search terms.
+        max_results: 1-50 results to return (default 10).
+    """
+    max_results = max(1, min(50, max_results))
+    session_id = str(uuid.uuid4())
+    body = {
+        "textQuery": {"input": query},
+        "contextAttributes": [{"key": "domain", "value": "docs.aws.amazon.com"}],
+        "acceptSuggestionBody": "RawText",
+        "locales": ["en_us"],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": AWS_DOCS_USER_AGENT,
+        "X-MCP-Session-Id": session_id,
+    }
+    try:
+        resp = requests.post(
+            f"{AWS_DOCS_SEARCH_URL}?session={session_id}",
+            json=body,
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return json.dumps({"error": f"AWS docs search failed: {e}"}, indent=2)
+
+    suggestions = data.get("suggestions") or data.get("results") or []
+    items = []
+    for s in suggestions[:max_results]:
+        body_ = s.get("textExcerptSuggestion") or s.get("suggestion") or {}
+        items.append({
+            "title": body_.get("title") or s.get("title", ""),
+            "url": body_.get("link") or body_.get("url") or s.get("url", ""),
+            "snippet": body_.get("summary") or body_.get("excerpt") or s.get("snippet", ""),
+            "context": body_.get("context", ""),
+        })
+    return json.dumps({
+        "source": "aws_docs",
+        "query": query,
+        "count": len(items),
+        "results": items,
+    }, indent=2)
+
+
+@mcp.tool()
+def search_gcp_docs(query: str, max_results: int = 10) -> str:
+    """
+    Search Google Cloud documentation via the Developer Knowledge API.
+
+    Requires GOOGLE_DEVKNOWLEDGE_API_KEY env var. Filters results to
+    docs.cloud.google.com by default.
+
+    Args:
+        query: Raw natural-language query.
+        max_results: 1-20 results (default 10; API max is 20).
+    """
+    if not GOOGLE_DEVKNOWLEDGE_API_KEY:
+        return json.dumps({
+            "error": "GOOGLE_DEVKNOWLEDGE_API_KEY not set.",
+            "hint": "Enable the Developer Knowledge API in a Google Cloud "
+                    "project, create an API key restricted to that API, and "
+                    "export GOOGLE_DEVKNOWLEDGE_API_KEY.",
+        }, indent=2)
+
+    max_results = max(1, min(20, max_results))
+    params = {
+        "key": GOOGLE_DEVKNOWLEDGE_API_KEY,
+        "query": query,
+        "pageSize": max_results,
+        "filter": 'dataSource = "cloud.google.com"',
+    }
+    try:
+        resp = requests.get(
+            f"{GOOGLE_DEVKNOWLEDGE_BASE}/documents:searchDocumentChunks",
+            params=params,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as e:
+        return json.dumps({
+            "error": f"GCP docs search failed: HTTP {resp.status_code}",
+            "body": resp.text[:500],
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"GCP docs search failed: {e}"}, indent=2)
+
+    items = []
+    for r in data.get("results", []):
+        doc = r.get("document") or {}
+        items.append({
+            "title": doc.get("title", ""),
+            "url": doc.get("uri") or r.get("parent", ""),
+            "snippet": r.get("content", "")[:500],
+            "chunk_id": r.get("id", ""),
+        })
+    return json.dumps({
+        "source": "gcp_docs",
+        "query": query,
+        "count": len(items),
+        "results": items,
+        "next_page_token": data.get("nextPageToken", ""),
+    }, indent=2)
+
+
+@mcp.tool()
+def search_microsoft_docs(query: str, max_results: int = 10) -> str:
+    """
+    Search Microsoft Learn documentation (learn.microsoft.com).
+
+    Uses the public site-search endpoint that powers the learn.microsoft.com
+    search bar. No auth. Includes docs, training, and reference content.
+
+    Args:
+        query: Search terms.
+        max_results: 1-50 results to return (default 10).
+    """
+    max_results = max(1, min(50, max_results))
+    params = {
+        "search": query,
+        "locale": "en-us",
+        "$top": max_results,
+        "expandScope": "true",
+        "partnerId": "LearnSite",
+    }
+    try:
+        resp = requests.get(MS_LEARN_SEARCH_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return json.dumps({"error": f"Microsoft Learn search failed: {e}"}, indent=2)
+
+    items = []
+    for r in data.get("results", [])[:max_results]:
+        items.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": (r.get("description") or r.get("summary") or "")[:500],
+            "content_type": r.get("contentType") or r.get("type", ""),
+            "last_updated": r.get("lastUpdatedDate", ""),
+        })
+    return json.dumps({
+        "source": "microsoft_learn",
+        "query": query,
+        "count": len(items),
+        "results": items,
+    }, indent=2)
+
+
+@mcp.tool()
+def fetch_cloud_doc_page(url: str, max_chars: int = 20000) -> str:
+    """
+    Fetch a documentation page from AWS, GCP, or Microsoft Learn and return
+    plain text (HTML tags stripped). Use after search_* tools to read a hit.
+
+    Args:
+        url: Full URL on docs.aws.amazon.com, cloud.google.com, or
+             learn.microsoft.com.
+        max_chars: Truncate body at this many chars (default 20000).
+    """
+    allowed = (
+        "docs.aws.amazon.com",
+        "cloud.google.com",
+        "learn.microsoft.com",
+    )
+    if not any(host in url for host in allowed):
+        return json.dumps({
+            "error": f"URL must be on one of: {', '.join(allowed)}",
+            "url": url,
+        }, indent=2)
+
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": AWS_DOCS_USER_AGENT},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception as e:
+        return json.dumps({"error": f"Fetch failed: {e}", "url": url}, indent=2)
+
+    text = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", html, flags=re.I)
+    text = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars]
+
+    return json.dumps({
+        "url": url,
+        "char_count": len(text),
+        "truncated": truncated,
+        "text": text,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# IAM DOCUMENTATION (Path A: Google PSE — Path C: local FTS crawler)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Path A — `search_iam_docs`: live search across ~23 OSS IAM doc sites via a
+# Google Programmable Search Engine (PSE). Requires GOOGLE_PSE_CX (the search
+# engine ID, not secret) and a Google API key with the Custom Search JSON API
+# enabled (GOOGLE_DEVKNOWLEDGE_API_KEY is reused).
+#
+# Path C — `index_iam_project`, `search_iam_index`, `list_iam_indexed`:
+# sitemap-driven crawler that stores extracted HTML text in the existing
+# SQLite+FTS5 store (piggybacks on the papers/chunks tables with synthetic
+# IDs prefixed 'iam:<project>:').
+
+# Corpus for the PSE (Path A) — keep in sync with the PSE's site list.
+IAM_DOCS_DOMAINS = [
+    # Identity providers / auth servers
+    "keycloak.org", "ory.sh", "supertokens.com", "authelia.com",
+    "goauthentik.io", "zitadel.com", "logto.io", "casdoor.org",
+    "authgear.com", "kanidm.github.io", "freeipa.org", "syncope.apache.org",
+    # Authorization engines
+    "openpolicyagent.org", "cerbos.dev", "authzed.com", "casbin.org",
+    "permify.co", "topaz.sh", "warrant.dev",
+    # Zero-trust / access proxies / secrets
+    "pomerium.com", "developer.hashicorp.com", "infisical.com",
+    # Standards & explainers
+    "webauthn.guide", "jwt.io", "datatracker.ietf.org", "zanzibar.academy",
+]
+
+# Tier-1 crawl targets for Path C. Projects use one of two URL-discovery
+# strategies depending on what the site exposes:
+#   - "sitemap": fetch sitemap.xml and filter by path_filters (substrings).
+#   - "seed_urls": start from a fixed list; optional follow_links does a
+#                  single-level link extraction from the seed pages.
+IAM_PROJECTS = {
+    "keycloak": {
+        "title": "Keycloak",
+        "sitemap": "https://www.keycloak.org/sitemap.xml",
+        "path_filters": ["/docs/", "/securing-apps/", "/guides/"],
+    },
+    "ory": {
+        "title": "Ory (Kratos, Hydra, Keto, Oathkeeper)",
+        "sitemap": "https://www.ory.sh/sitemap.xml",
+        "path_filters": ["/docs/"],
+    },
+    "opa": {
+        "title": "Open Policy Agent",
+        "sitemap": "https://www.openpolicyagent.org/sitemap.xml",
+        "path_filters": ["openpolicyagent.org/docs/"],
+    },
+    "vault": {
+        "title": "HashiCorp Vault",
+        "seed_urls": ["https://developer.hashicorp.com/vault/docs"],
+        "follow_links": True,
+        "path_filters": ["developer.hashicorp.com/vault/docs"],
+    },
+    "syncope": {
+        "title": "Apache Syncope",
+        # Reference + getting-started are monolithic HTML pages per version.
+        "seed_urls": [
+            "https://syncope.apache.org/docs/4.1/reference-guide.html",
+            "https://syncope.apache.org/docs/4.1/getting-started.html",
+            "https://syncope.apache.org/docs/4.0/reference-guide.html",
+            "https://syncope.apache.org/docs/4.0/getting-started.html",
+        ],
+        "follow_links": False,
+    },
+    "freeipa": {
+        "title": "FreeIPA",
+        "seed_urls": ["https://www.freeipa.org/page/Documentation.html"],
+        "follow_links": True,
+        "path_filters": ["freeipa.org/page/"],
+    },
+}
+
+GOOGLE_PSE_CX = os.environ.get("GOOGLE_PSE_CX")
+CUSTOM_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+
+# ── Path A ──────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def search_iam_docs(query: str, max_results: int = 10) -> str:
+    """
+    Live search across ~23 OSS IAM documentation sites via Google
+    Programmable Search Engine.
+
+    Covers Keycloak, Ory, SuperTokens, Authelia, authentik, ZITADEL, Logto,
+    Casdoor, Authgear, Kanidm, FreeIPA, Apache Syncope, OPA, Cerbos,
+    SpiceDB (authzed), Casbin, Permify, Topaz, Warrant, Pomerium,
+    HashiCorp Vault, Infisical, and standards/explainers (webauthn.guide,
+    jwt.io, IETF datatracker, zanzibar.academy).
+
+    Requires env vars GOOGLE_PSE_CX + GOOGLE_DEVKNOWLEDGE_API_KEY (the key
+    must have the Custom Search JSON API enabled).
+
+    Args:
+        query: Search terms.
+        max_results: 1-10 results per call (Custom Search API max is 10).
+    """
+    if not GOOGLE_PSE_CX:
+        return json.dumps({
+            "error": "GOOGLE_PSE_CX not set.",
+            "hint": "Create a Programmable Search Engine at "
+                    "programmablesearchengine.google.com scoped to IAM doc "
+                    "sites, then export the search engine ID as GOOGLE_PSE_CX.",
+        }, indent=2)
+    if not GOOGLE_DEVKNOWLEDGE_API_KEY:
+        return json.dumps({
+            "error": "GOOGLE_DEVKNOWLEDGE_API_KEY not set.",
+            "hint": "Also enable 'Custom Search API' on the same key in the "
+                    "GCP console (APIs & Services → Library).",
+        }, indent=2)
+
+    max_results = max(1, min(10, max_results))
+    try:
+        resp = requests.get(
+            CUSTOM_SEARCH_URL,
+            params={
+                "key": GOOGLE_DEVKNOWLEDGE_API_KEY,
+                "cx": GOOGLE_PSE_CX,
+                "q": query,
+                "num": max_results,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError:
+        return json.dumps({
+            "error": f"IAM docs search failed: HTTP {resp.status_code}",
+            "body": resp.text[:500],
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"IAM docs search failed: {e}"}, indent=2)
+
+    items = []
+    for r in data.get("items", []):
+        items.append({
+            "title": r.get("title", ""),
+            "url": r.get("link", ""),
+            "snippet": r.get("snippet", ""),
+            "display_url": r.get("displayLink", ""),
+        })
+    return json.dumps({
+        "source": "iam_docs_pse",
+        "query": query,
+        "total_results": int(data.get("searchInformation", {}).get("totalResults", "0")),
+        "count": len(items),
+        "results": items,
+    }, indent=2)
+
+
+# ── Path C ──────────────────────────────────────────────────────────────
+
+def _extract_main_text(html: str) -> tuple[str, str]:
+    """Return (title, plain_text) from an HTML page, stripping scripts/styles/tags."""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
+    title = title_match.group(1).strip() if title_match else ""
+
+    body = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", html, flags=re.I)
+    body = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", body, flags=re.I)
+    body = re.sub(r"<nav\b[^<]*(?:(?!</nav>)<[^<]*)*</nav>", " ", body, flags=re.I)
+    body = re.sub(r"<footer\b[^<]*(?:(?!</footer>)<[^<]*)*</footer>", " ", body, flags=re.I)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return title, body
+
+
+def _parse_sitemap(xml: str) -> list[str]:
+    """Extract <loc> URLs from a sitemap (handles sitemap-index too)."""
+    return re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml)
+
+
+def _extract_links(html: str, base_url: str) -> list[str]:
+    """Pull href URLs out of HTML and resolve relative paths against base_url."""
+    from urllib.parse import urljoin
+    hrefs = re.findall(r'href\s*=\s*["\']([^"\'#]+)', html, flags=re.I)
+    return [urljoin(base_url, h) for h in hrefs]
+
+
+def _resolve_project_urls(cfg: dict) -> list[str]:
+    """Build the candidate URL list for a project based on its config."""
+    path_filters = cfg.get("path_filters", [])
+
+    if "sitemap" in cfg:
+        try:
+            r = requests.get(
+                cfg["sitemap"],
+                headers={"User-Agent": AWS_DOCS_USER_AGENT},
+                timeout=30,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Sitemap fetch failed: {e}")
+
+        urls = _parse_sitemap(r.text)
+        nested = [u for u in urls if u.endswith(".xml")]
+        if nested and len(nested) == len(urls):
+            expanded = []
+            for nu in nested[:10]:
+                try:
+                    rr = requests.get(nu, timeout=30)
+                    rr.raise_for_status()
+                    expanded.extend(_parse_sitemap(rr.text))
+                except Exception:
+                    continue
+            urls = expanded
+    elif "seed_urls" in cfg:
+        urls = list(cfg["seed_urls"])
+        if cfg.get("follow_links"):
+            for seed in list(cfg["seed_urls"]):
+                try:
+                    r = requests.get(
+                        seed,
+                        headers={"User-Agent": AWS_DOCS_USER_AGENT},
+                        timeout=30,
+                    )
+                    r.raise_for_status()
+                    urls.extend(_extract_links(r.text, seed))
+                except Exception:
+                    continue
+    else:
+        raise RuntimeError("Project config has neither 'sitemap' nor 'seed_urls'.")
+
+    if path_filters:
+        urls = [u for u in urls if any(f in u for f in path_filters)]
+
+    seen = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
+
+
+@mcp.tool()
+def index_iam_project(project: str, max_pages: int = 100) -> str:
+    """
+    Crawl one IAM project's docs and index into the local FTS store. Pages
+    are stored with IDs like 'iam:<project>:<hash>' so query_papers and
+    search_iam_index find them.
+
+    Tier-1 projects: keycloak, ory, opa (sitemap-based);
+                     vault, syncope, freeipa (seed-URL based).
+
+    Args:
+        project: Project key (see list_iam_indexed for available keys).
+        max_pages: Cap on pages fetched per run (default 100). Raise later
+                   runs to grow the corpus; already-indexed pages are skipped
+                   when their content hash matches.
+    """
+    if project not in IAM_PROJECTS:
+        return json.dumps({
+            "error": f"Unknown project '{project}'.",
+            "available": sorted(IAM_PROJECTS.keys()),
+        }, indent=2)
+
+    cfg = IAM_PROJECTS[project]
+    max_pages = max(1, min(500, max_pages))
+
+    try:
+        all_urls = _resolve_project_urls(cfg)
+    except Exception as e:
+        return json.dumps({"error": str(e), "project": project}, indent=2)
+
+    candidates = all_urls[:max_pages]
+
+    idx = _get_index()
+    stats = {"fetched": 0, "indexed": 0, "skipped": 0, "failed": 0}
+    errors = []
+
+    for url in candidates:
+        page_id = f"iam:{project}:{hashlib.sha1(url.encode()).hexdigest()[:16]}"
+        try:
+            r = requests.get(
+                url,
+                headers={"User-Agent": AWS_DOCS_USER_AGENT},
+                timeout=30,
+            )
+            r.raise_for_status()
+            stats["fetched"] += 1
+        except Exception as e:
+            stats["failed"] += 1
+            errors.append({"url": url, "error": str(e)})
+            continue
+
+        title, text = _extract_main_text(r.text)
+        if len(text) < 200:
+            stats["skipped"] += 1
+            continue
+
+        content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        if not idx.needs_reindex(page_id, content_hash):
+            stats["skipped"] += 1
+            continue
+
+        chunks = chunk_pages([{"page": 1, "text": text}])
+        meta = {
+            "arxiv_id": page_id,
+            "title": title or url,
+            "authors": [],
+            "summary": text[:400],
+            "categories": ["iam", project],
+            "published": "",
+        }
+        idx.upsert_paper(meta, chunks, url, 1, content_hash)
+        stats["indexed"] += 1
+        time.sleep(0.2)  # be polite to the doc host
+
+    return json.dumps({
+        "project": project,
+        "title": cfg["title"],
+        "sitemap_urls_total": len(all_urls),
+        "candidate_urls": len(candidates),
+        "stats": stats,
+        "errors": errors[:5],
+    }, indent=2)
+
+
+@mcp.tool()
+def search_iam_index(query: str, project: str = "", max_results: int = 20) -> str:
+    """
+    Full-text search over locally indexed IAM docs (populated by
+    `index_iam_project`).
+
+    Args:
+        query: Search terms (supports FTS5 syntax — see query_papers).
+        project: Optional project key to restrict results (e.g. 'keycloak').
+        max_results: Max chunks to return (default 20).
+    """
+    idx = _get_index()
+    sql_prefix = "iam:%"
+    if project:
+        if project not in IAM_PROJECTS:
+            return json.dumps({
+                "error": f"Unknown project '{project}'.",
+                "available": sorted(IAM_PROJECTS.keys()),
+            }, indent=2)
+        sql_prefix = f"iam:{project}:%"
+
+    fts_query = idx._to_fts_query(query)
+    rows = idx.conn.execute("""
+        SELECT c.arxiv_id, c.heading, c.content, c.chunk_index,
+               p.title, p.pdf_path AS url, rank
+        FROM chunks_fts
+        JOIN chunks c ON c.chunk_id = chunks_fts.rowid
+        JOIN papers p ON p.arxiv_id = c.arxiv_id
+        WHERE chunks_fts MATCH ? AND c.arxiv_id LIKE ?
+        ORDER BY rank
+        LIMIT ?
+    """, (fts_query, sql_prefix, max_results)).fetchall()
+
+    results = []
+    for row in rows:
+        page_id = row["arxiv_id"]
+        proj = page_id.split(":")[1] if page_id.startswith("iam:") else ""
+        results.append({
+            "project": proj,
+            "title": row["title"],
+            "url": row["url"],
+            "heading": row["heading"],
+            "snippet": row["content"][:500],
+            "relevance_rank": row["rank"],
+        })
+    return json.dumps({
+        "query": query,
+        "project_filter": project or "all",
+        "count": len(results),
+        "results": results,
+    }, indent=2)
+
+
+@mcp.tool()
+def list_iam_indexed() -> str:
+    """
+    Show which IAM projects are available for indexing and how many pages
+    are currently stored for each.
+    """
+    idx = _get_index()
+    counts = {}
+    for row in idx.conn.execute("""
+        SELECT arxiv_id FROM papers WHERE arxiv_id LIKE 'iam:%'
+    """).fetchall():
+        proj = row["arxiv_id"].split(":")[1]
+        counts[proj] = counts.get(proj, 0) + 1
+
+    projects = []
+    for key, cfg in IAM_PROJECTS.items():
+        projects.append({
+            "key": key,
+            "title": cfg["title"],
+            "source": cfg.get("sitemap") or f"seed_urls ({len(cfg.get('seed_urls', []))})",
+            "indexed_pages": counts.get(key, 0),
+        })
+    return json.dumps({
+        "total_indexed_pages": sum(counts.values()),
+        "projects": projects,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GITHUB (narrow, research-focused tools)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A small set of GitHub tools aimed at research workflows: finding paper
+# implementations, browsing topic-related repos, and reading READMEs. For
+# general GitHub work (issues, PRs, actions, writes) use the official
+# github/github-mcp-server alongside this one — don't duplicate it here.
+#
+# Auth: set GITHUB_TOKEN for 5000 req/hr and to enable code search
+# (code search *requires* auth). Without a token, repo search still works
+# at 60 req/hr.
+
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+
+
+def _github_headers() -> dict:
+    h = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "my-research-mcp-server/2.0",
+    }
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
+
+@mcp.tool()
+def search_github_repos(query: str, max_results: int = 10, sort: str = "stars") -> str:
+    """
+    Search GitHub repositories — useful for finding reference
+    implementations, topic surveys, or tooling related to a paper.
+
+    Args:
+        query: GitHub search query (supports qualifiers like
+               'topic:diffusion language:python stars:>100').
+        max_results: 1-50 results (default 10).
+        sort: 'stars', 'forks', 'updated', or 'best-match' (default 'stars').
+    """
+    max_results = max(1, min(50, max_results))
+    params = {"q": query, "per_page": max_results}
+    if sort != "best-match":
+        params["sort"] = sort
+        params["order"] = "desc"
+    try:
+        resp = requests.get(
+            f"{GITHUB_API_BASE}/search/repositories",
+            params=params,
+            headers=_github_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return json.dumps({"error": f"GitHub repo search failed: {e}"}, indent=2)
+
+    items = []
+    for r in data.get("items", [])[:max_results]:
+        items.append({
+            "full_name": r.get("full_name", ""),
+            "url": r.get("html_url", ""),
+            "description": r.get("description", ""),
+            "stars": r.get("stargazers_count", 0),
+            "forks": r.get("forks_count", 0),
+            "language": r.get("language", ""),
+            "topics": r.get("topics", []),
+            "updated_at": r.get("updated_at", ""),
+        })
+    return json.dumps({
+        "source": "github_repos",
+        "query": query,
+        "total_count": data.get("total_count", 0),
+        "count": len(items),
+        "results": items,
+    }, indent=2)
+
+
+@mcp.tool()
+def search_github_code(query: str, max_results: int = 10) -> str:
+    """
+    Search code across public GitHub repositories. Requires GITHUB_TOKEN.
+
+    Useful for finding implementations of a specific algorithm, function
+    name, or string from a paper.
+
+    Args:
+        query: GitHub code-search query (supports 'repo:', 'language:',
+               'filename:', 'path:' qualifiers).
+        max_results: 1-30 results (default 10).
+    """
+    if not GITHUB_TOKEN:
+        return json.dumps({
+            "error": "GITHUB_TOKEN not set.",
+            "hint": "Code search requires auth. Create a fine-grained PAT "
+                    "with public-repo read access and export GITHUB_TOKEN.",
+        }, indent=2)
+
+    max_results = max(1, min(30, max_results))
+    try:
+        resp = requests.get(
+            f"{GITHUB_API_BASE}/search/code",
+            params={"q": query, "per_page": max_results},
+            headers=_github_headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return json.dumps({"error": f"GitHub code search failed: {e}"}, indent=2)
+
+    items = []
+    for r in data.get("items", [])[:max_results]:
+        repo = r.get("repository", {}) or {}
+        items.append({
+            "repo": repo.get("full_name", ""),
+            "path": r.get("path", ""),
+            "url": r.get("html_url", ""),
+            "score": r.get("score", 0),
+        })
+    return json.dumps({
+        "source": "github_code",
+        "query": query,
+        "total_count": data.get("total_count", 0),
+        "count": len(items),
+        "results": items,
+    }, indent=2)
+
+
+@mcp.tool()
+def fetch_github_readme(repo: str, max_chars: int = 20000) -> str:
+    """
+    Fetch a repo's README as plain text.
+
+    Args:
+        repo: 'owner/name' (e.g. 'pytorch/pytorch').
+        max_chars: Truncate at this many chars (default 20000).
+    """
+    if "/" not in repo:
+        return json.dumps({"error": "repo must be in 'owner/name' form"}, indent=2)
+
+    try:
+        resp = requests.get(
+            f"{GITHUB_API_BASE}/repos/{repo}/readme",
+            headers={**_github_headers(), "Accept": "application/vnd.github.raw"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        text = resp.text
+    except Exception as e:
+        return json.dumps({"error": f"README fetch failed: {e}", "repo": repo}, indent=2)
+
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars]
+    return json.dumps({
+        "repo": repo,
+        "char_count": len(text),
+        "truncated": truncated,
+        "text": text,
+    }, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Entrypoint
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="arXiv MCP Server")
+    parser = argparse.ArgumentParser(description="My Research MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
 
     if args.transport == "sse":
         mcp.settings.port = args.port
-        logger.info(f"Starting arXiv MCP server (SSE) on port {args.port}")
+        logger.info(f"Starting My Research MCP server (SSE) on port {args.port}")
         mcp.run(transport="sse")
     else:
-        logger.info("Starting arXiv MCP server (stdio)")
+        logger.info("Starting My Research MCP server (stdio)")
         mcp.run(transport="stdio")

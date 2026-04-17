@@ -1,11 +1,11 @@
 [project]
-name = "arxiv-mcp-server"
-version = "1.0.0"
-description = "MCP server for searching arXiv, downloading PDFs, and full-text search across paper content"
+name = "my-research-mcp-server"
+version = "2.0.0"
+description = "MCP server for searching arXiv, Semantic Scholar, Harvard DASH, MIT DSpace, Cornell eCommons, Penn ScholarlyCommons — with full-text PDF indexing and search"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-keywords = ["mcp", "arxiv", "research", "pdf", "full-text-search"]
+keywords = ["mcp", "arxiv", "research", "pdf", "full-text-search", "semantic-scholar", "dspace"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -31,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-arxiv-mcp = "server:mcp.run"
+my-research-mcp = "server:mcp.run"
 
 [build-system]
 requires = ["setuptools>=68.0"]
